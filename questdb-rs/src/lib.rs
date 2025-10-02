@@ -33,4 +33,4 @@ pub mod ingress;
 pub use error::*;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -27,9 +27,9 @@
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, fmt, Result};
-use crate::ingress::conf::ConfigSetting;
+use crate::ingress::conf::{AuthParams, ConfigSetting};
+use crate::ingress::tls::TlsSettings;
 use core::time::Duration;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter, Write};
 
 use std::ops::Deref;
@@ -44,6 +44,7 @@ use aws_lc_rs::{
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
 
+use questdb_confstr::Params;
 #[cfg(all(feature = "_sender-tcp", feature = "ring-crypto"))]
 use ring::{
     rand::SystemRandom,
@@ -161,9 +162,9 @@ impl From<u16> for Port {
     }
 }
 
-fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
+fn validate_auto_flush_params(params: &Params) -> Result<()> {
     if let Some(auto_flush) = params.get("auto_flush") {
-        if auto_flush.as_str() != "off" {
+        if auto_flush != "off" {
             return Err(error::fmt!(
                 ConfigError,
                 "Invalid auto_flush value '{auto_flush}'. This client does not \
@@ -328,8 +329,8 @@ impl Protocol {
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     protocol: Protocol,
-    host: ConfigSetting<String>,
-    port: ConfigSetting<String>,
+    // preserves config order
+    endpoints: ConfigSetting<Vec<Endpoint>>,
     net_interface: ConfigSetting<Option<String>>,
     max_buf_size: ConfigSetting<usize>,
     max_name_len: ConfigSetting<usize>,
@@ -392,17 +393,30 @@ impl SenderBuilder {
 
         let protocol = Protocol::from_schema(service)?;
 
-        let Some(addr) = params.get("addr") else {
+        let Some(addrs) = conf.get_all("addr") else {
             return Err(error::fmt!(
                 ConfigError,
                 "Missing \"addr\" parameter in config string"
             ));
         };
-        let (host, port) = match addr.split_once(':') {
-            Some((h, p)) => (h, p),
-            None => (addr.as_str(), protocol.default_port()),
+        let mut builder = if addrs.len() == 1 {
+            let addr = &addrs[0];
+            let (host, port) = match addr.split_once(':') {
+                Some((h, p)) => (h, p),
+                None => (addr.as_str(), protocol.default_port()),
+            };
+            SenderBuilder::new(protocol, host, port)
+        } else {
+            let mut endpoints = Vec::with_capacity(addrs.len());
+            for addr in addrs.iter() {
+                let (host, port) = match addr.split_once(':') {
+                    Some((h, p)) => (h, p),
+                    None => (addr.as_str(), protocol.default_port()),
+                };
+                endpoints.push((host, port));
+            }
+            SenderBuilder::new_multi_endpoints(protocol, endpoints)
         };
-        let mut builder = SenderBuilder::new(protocol, host, port);
 
         validate_auto_flush_params(params)?;
 
@@ -570,9 +584,22 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Self {
-        let host = host.into();
-        let port: Port = port.into();
-        let port = port.0;
+        SenderBuilder::new_multi_endpoints(protocol, vec![(host, port)])
+    }
+
+    pub fn new_multi_endpoints<H: Into<String>, P: Into<Port>>(
+        protocol: Protocol,
+        endpoints: Vec<(H, P)>,
+    ) -> Self {
+        let mut endpoints: Vec<Endpoint> = endpoints
+            .into_iter()
+            .map(|(h, p)| {
+                let host: String = h.into();
+                let port: Port = p.into();
+                Endpoint { host, port: port.0 }
+            })
+            .collect();
+        dedup_endpoints(&mut endpoints);
 
         #[cfg(feature = "tls-webpki-certs")]
         let tls_ca = CertificateAuthority::WebpkiRoots;
@@ -585,8 +612,7 @@ impl SenderBuilder {
 
         Self {
             protocol,
-            host: ConfigSetting::new_specified(host),
-            port: ConfigSetting::new_specified(port),
+            endpoints: ConfigSetting::new_specified(endpoints),
             net_interface: ConfigSetting::new_default(None),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
             max_name_len: ConfigSetting::new_default(MAX_NAME_LEN_DEFAULT),
@@ -1016,7 +1042,14 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
-        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+        if self.endpoints.is_empty() {
+            return Err(error::fmt!(ConfigError, "empty endpoints list."));
+        }
+
+        let mut descr = "Sender[".to_string();
+        for ep in self.endpoints.iter() {
+            write!(descr, "host={:?},port={:?},", ep.host, ep.port).unwrap();
+        }
 
         if self.protocol.tls_enabled() {
             write!(descr, "tls=enabled,").unwrap();
@@ -1037,131 +1070,25 @@ impl SenderBuilder {
 
         let auth = self.build_auth()?;
 
-        let handler = match self.protocol {
-            #[cfg(feature = "sync-sender-tcp")]
-            Protocol::Tcp | Protocol::Tcps => connect_tcp(
-                self.host.as_str(),
-                self.port.as_str(),
-                self.net_interface.deref().as_deref(),
-                *self.auth_timeout,
-                tls_settings,
-                &auth,
-            )?,
-            #[cfg(feature = "sync-sender-http")]
-            Protocol::Http | Protocol::Https => {
-                use ureq::unversioned::transport::Connector;
-                use ureq::unversioned::transport::TcpConnector;
-                if self.net_interface.is_some() {
-                    // See: https://github.com/algesten/ureq/issues/692
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "net_interface is not supported for ILP over HTTP."
-                    ));
-                }
-
-                let http_config = self.http.as_ref().unwrap();
-                let user_agent = http_config.user_agent.as_str();
-                let connector = TcpConnector::default();
-
-                let agent_builder = ureq::Agent::config_builder()
-                    .user_agent(user_agent)
-                    .no_delay(true);
-
-                let tls_config = match tls_settings {
-                    Some(tls_settings) => Some(tls::configure_tls(tls_settings)?),
-                    None => None,
-                };
-
-                let connector = connector.chain(TlsConnector::new(tls_config));
-
-                let auth = match auth {
-                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
-
-                    #[cfg(feature = "sync-sender-tcp")]
-                    Some(conf::AuthParams::Ecdsa(_)) => {
-                        return Err(fmt!(
-                            AuthError,
-                            "ECDSA authentication is not supported for ILP over HTTP. \
-                            Please use basic or token authentication instead."
-                        ));
-                    }
-                    None => None,
-                };
-                let agent_builder = agent_builder
-                    .timeout_connect(Some(*http_config.request_timeout.deref()))
-                    .http_status_as_error(false);
-                let agent = ureq::Agent::with_parts(
-                    agent_builder.build(),
-                    connector,
-                    ureq::unversioned::resolver::DefaultResolver::default(),
-                );
-                let proto = self.protocol.schema();
-                let url = format!(
-                    "{}://{}:{}/write",
-                    proto,
-                    self.host.deref(),
-                    self.port.deref()
-                );
-                SyncProtocolHandler::SyncHttp(SyncHttpHandlerState {
-                    agent,
-                    url,
-                    auth,
-                    config: self.http.as_ref().unwrap().clone(),
-                })
-            }
-        };
-
-        #[allow(unused_mut)]
-        let mut max_name_len = *self.max_name_len;
-
-        let protocol_version = match self.protocol_version.deref() {
-            Some(v) => *v,
-            None => match self.protocol {
-                #[cfg(feature = "sync-sender-tcp")]
-                Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
-                #[cfg(feature = "sync-sender-http")]
-                Protocol::Http | Protocol::Https => {
-                    #[allow(irrefutable_let_patterns)]
-                    if let SyncProtocolHandler::SyncHttp(http_state) = &handler {
-                        let settings_url = &format!(
-                            "{}://{}:{}/settings",
-                            self.protocol.schema(),
-                            self.host.deref(),
-                            self.port.deref()
-                        );
-                        let (protocol_versions, server_max_name_len) =
-                            read_server_settings(http_state, settings_url, max_name_len)?;
-                        max_name_len = server_max_name_len;
-                        if protocol_versions.contains(&ProtocolVersion::V2) {
-                            ProtocolVersion::V2
-                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
-                            ProtocolVersion::V1
-                        } else {
-                            return Err(fmt!(
-                                ProtocolVersionError,
-                                "Server does not support current client"
-                            ));
-                        }
-                    } else {
-                        unreachable!("HTTP handler should be used for HTTP protocol");
-                    }
-                }
-            },
-        };
-
         if auth.is_some() {
             descr.push_str("auth=on]");
         } else {
             descr.push_str("auth=off]");
         }
 
+        let conn_meta = match self.protocol {
+            #[cfg(feature = "sync-sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => self.build_tcp(tls_settings, &auth)?,
+            #[cfg(feature = "sync-sender-http")]
+            Protocol::Http | Protocol::Https => self.build_http(tls_settings, auth)?,
+        };
+
         let sender = Sender::new(
             descr,
-            handler,
+            conn_meta.handler,
             *self.max_buf_size,
-            protocol_version,
-            max_name_len,
+            conn_meta.protocol_version,
+            conn_meta.max_name_len,
         );
 
         Ok(sender)
@@ -1178,6 +1105,207 @@ impl SenderBuilder {
             ))
         }
     }
+
+    // use for http/https
+    fn build_http(
+        &self,
+        tls_settings: Option<TlsSettings>,
+        auth: Option<AuthParams>,
+    ) -> Result<ConnectionMeta> {
+        if self.net_interface.is_some() {
+            // See: https://github.com/algesten/ureq/issues/692
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for ILP over HTTP."
+            ));
+        }
+
+        let agent = self.build_agent(tls_settings)?;
+
+        let auth = match auth {
+            Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
+            Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+
+            #[cfg(feature = "sync-sender-tcp")]
+            Some(conf::AuthParams::Ecdsa(_)) => {
+                return Err(fmt!(
+                    AuthError,
+                    "ECDSA authentication is not supported for ILP over HTTP. \
+                    Please use basic or token authentication instead."
+                ));
+            }
+            None => None,
+        };
+
+        let http_config = self.http.as_ref().unwrap();
+        let proto = self.protocol.schema();
+
+        // minimizing /settings round-trips when constructing a Sender.
+        //
+        // - If protocol_version is explicitly set: do not call /settings.
+        // - Otherwise, issue a single /settings request to the first available endpoint in config order
+        //   (treat it as the primary) and derive protocol_version and max_name_len from it.
+        // - Do not query `accepting.writes` on every endpoint during build; rely on failover
+        //   at send time for this.
+        //
+        // Rationale: many apps create a new Sender per flush. Assuming #failovers >> #build_calls,
+        // this strategy reduces total HTTP requests.
+
+        let mut urls = Vec::with_capacity(self.endpoints.len());
+        for endpoint in self.endpoints.iter() {
+            let url = format!("{}://{}:{}/write", proto, endpoint.host, endpoint.port);
+            urls.push(url);
+        }
+
+        if let Some(protocol_version) = self.protocol_version.deref() {
+            let http_state = SyncHttpHandlerState {
+                agent,
+                urls,
+                active_url_idx: 0,
+                auth,
+                config: http_config.clone(),
+            };
+
+            return Ok(ConnectionMeta {
+                handler: SyncProtocolHandler::SyncHttp(http_state),
+                max_name_len: *self.max_name_len,
+                protocol_version: *protocol_version,
+            });
+        }
+
+        let mut server_settings = None;
+        let mut active_url_idx = 0;
+        for (idx, endpoint) in self.endpoints.iter().enumerate() {
+            let settings_url = &format!("{}://{}:{}/settings", proto, endpoint.host, endpoint.port);
+            if let Ok(settings) = read_server_settings(
+                &agent,
+                settings_url,
+                *http_config.request_timeout,
+                *self.max_name_len,
+            ) {
+                server_settings = Some(settings);
+                active_url_idx = idx;
+                break;
+            }
+            // don't like ignoring an error here, but since this is library code,
+            // writing directly to stdout isn't a good idea either.
+        }
+
+        let server_settings = match server_settings {
+            Some(settings) => settings,
+            None => {
+                return Err(fmt!(
+                    ConfigError,
+                    "Reading settings failed for all endpoints configured."
+                ))
+            }
+        };
+
+        let max_name_len = server_settings.max_name_len;
+        let supported_versions = server_settings.supported_versions;
+        let protocol_version = if supported_versions.contains(&ProtocolVersion::V2) {
+            ProtocolVersion::V2
+        } else if supported_versions.contains(&ProtocolVersion::V1) {
+            ProtocolVersion::V1
+        } else {
+            return Err(fmt!(
+                ProtocolVersionError,
+                "Server does not support current client"
+            ));
+        };
+
+        let http_state = SyncHttpHandlerState {
+            agent,
+            urls,
+            active_url_idx,
+            auth,
+            config: http_config.clone(),
+        };
+
+        Ok(ConnectionMeta {
+            handler: SyncProtocolHandler::SyncHttp(http_state),
+            max_name_len,
+            protocol_version,
+        })
+    }
+
+    // use for tcp/tcps
+    fn build_tcp(
+        &self,
+        tls_settings: Option<TlsSettings>,
+        auth: &Option<AuthParams>,
+    ) -> Result<ConnectionMeta> {
+        let protocol_version = match self.protocol_version.deref() {
+            Some(v) => *v,
+            None => ProtocolVersion::V1,
+        };
+        if self.endpoints.len() > 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "providing more than one endpoint is not supported for TCP."
+            ));
+        }
+        let ep = &self.endpoints[0];
+        let handler = connect_tcp(
+            ep.host.as_str(),
+            ep.port.as_str(),
+            self.net_interface.deref().as_deref(),
+            *self.auth_timeout,
+            tls_settings,
+            auth,
+        )?;
+        Ok(ConnectionMeta {
+            handler,
+            max_name_len: *self.max_name_len,
+            protocol_version,
+        })
+    }
+
+    fn build_agent(&self, tls_settings: Option<TlsSettings>) -> Result<ureq::Agent> {
+        use ureq::unversioned::transport::Connector;
+        use ureq::unversioned::transport::TcpConnector;
+        let http_config = self.http.as_ref().unwrap();
+        let user_agent = http_config.user_agent.as_str();
+        let connector = TcpConnector::default();
+
+        let agent_builder = ureq::Agent::config_builder()
+            .user_agent(user_agent)
+            .no_delay(true);
+
+        let tls_config = match tls_settings {
+            Some(tls_settings) => Some(tls::configure_tls(tls_settings)?),
+            None => None,
+        };
+
+        let connector = connector.chain(TlsConnector::new(tls_config));
+        let agent_builder = agent_builder
+            .timeout_connect(Some(*http_config.request_timeout.deref()))
+            .http_status_as_error(false);
+
+        Ok(ureq::Agent::with_parts(
+            agent_builder.build(),
+            connector,
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        ))
+    }
+}
+
+struct ConnectionMeta {
+    handler: SyncProtocolHandler,
+    max_name_len: usize,
+    protocol_version: ProtocolVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: String,
+}
+
+fn dedup_endpoints(endpoints: &mut Vec<Endpoint>) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    endpoints.retain(|ep| seen.insert((ep.host.clone(), ep.port.clone())));
 }
 
 /// When parsing from config, we exclude certain characters.

@@ -49,7 +49,8 @@ pub(crate) struct SyncHttpHandlerState {
     pub(crate) agent: ureq::Agent,
 
     /// The URL of the HTTP endpoint.
-    pub(crate) url: String,
+    pub(crate) urls: Vec<String>,
+    pub(crate) active_url_idx: usize,
 
     /// The content of the `Authorization` HTTP header.
     pub(crate) auth: Option<String>,
@@ -58,16 +59,26 @@ pub(crate) struct SyncHttpHandlerState {
     pub(crate) config: HttpConfig,
 }
 
+#[derive(Debug)]
+pub(crate) struct SendError<'a>(ureq::Error, &'a str); // with url
+
+impl<'a> SendError<'a> {
+    pub fn into_parts(self) -> (ureq::Error, &'a str) {
+        (self.0, self.1)
+    }
+}
+
 #[cfg(feature = "sync-sender-http")]
 impl SyncHttpHandlerState {
     fn send_request(
         &self,
+        url: &str,
         buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, Result<Response<Body>, ureq::Error>) {
+    ) -> Result<Response<Body>, ureq::Error> {
         let request = self
             .agent
-            .post(&self.url)
+            .post(url)
             .config()
             .timeout_per_call(Some(request_timeout))
             .build()
@@ -78,29 +89,75 @@ impl SyncHttpHandlerState {
             Some(auth) => request.header("Authorization", auth),
             None => request,
         };
-        let response = request.send(buf);
-        match &response {
-            Ok(res) => (need_retry(Ok(res.status())), response),
-            Err(err) => (need_retry(Err(err)), response),
-        }
+        request.send(buf)
     }
 
-    pub(crate) fn get_request(
+    pub(crate) fn send_with_retries(
         &self,
         url: &str,
+        buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, Result<Response<Body>, ureq::Error>) {
-        let request = self
-            .agent
-            .get(url)
-            .config()
-            .timeout_per_call(Some(request_timeout))
-            .build();
-        let response = request.call();
-        match &response {
-            Ok(res) => (need_retry(Ok(res.status())), response),
-            Err(err) => (need_retry(Err(err)), response),
+        retry_timeout: Duration,
+    ) -> Result<Response<Body>, ureq::Error> {
+        retry_http(
+            request_timeout,
+            retry_timeout,
+            |timeout| self.send_request(url, buf, timeout),
+            |res: &Result<Response<Body>, ureq::Error>| match res {
+                Ok(res) => need_retry(Ok(res.status())),
+                Err(err) => need_retry(Err(err)),
+            },
+        )
+    }
+
+    pub(crate) fn send_with_retries_and_failover(
+        &mut self,
+        buf: &[u8],
+        request_timeout: Duration,
+        retry_timeout: Duration,
+    ) -> Result<Response<Body>, SendError<'_>> {
+        let url = self.urls[self.active_url_idx].as_str();
+        let resp = self.send_with_retries(url, buf, request_timeout, retry_timeout);
+        if !need_to_failover(&resp) || self.urls.len() == 1 {
+            return resp.map_err(|err| SendError(err, url));
         }
+        let bad_url = url;
+
+        // failover
+        for (idx, url) in self.urls.iter().enumerate() {
+            if url == bad_url {
+                continue;
+            }
+            let resp = self.send_with_retries(url, buf, request_timeout, retry_timeout);
+            if !need_to_failover(&resp) {
+                self.active_url_idx = idx;
+                return resp.map_err(|err| SendError(err, url));
+            }
+        }
+
+        // in case all of them are bad return the first one
+        // maybe want to create explicit error AllFailed ?
+        resp.map_err(|err| SendError(err, url))
+    }
+}
+
+fn need_to_failover(resp: &Result<Response<Body>, ureq::Error>) -> bool {
+    match resp {
+        Ok(res) => {
+            matches!(
+                res.status(),
+                http::StatusCode::MISDIRECTED_REQUEST | http::StatusCode::NOT_FOUND
+            )
+        }
+        Err(err) => match err {
+            ureq::Error::StatusCode(code) => {
+                *code == http::StatusCode::MISDIRECTED_REQUEST.as_u16()
+                    || *code == http::StatusCode::NOT_FOUND.as_u16()
+            }
+            ureq::Error::ConnectionFailed => true,
+            ureq::Error::Io(_) => true,
+            _ => false,
+        },
     }
 }
 
@@ -332,72 +389,31 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
     }
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
-fn retry_http_send(
-    state: &SyncHttpHandlerState,
-    buf: &[u8],
-    request_timeout: Duration,
-    retry_timeout: Duration,
-    mut last_rep: Result<Response<Body>, ureq::Error>,
-) -> Result<Response<Body>, ureq::Error> {
-    let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
-    let mut retry_interval_ms = 10;
-    let mut need_retry;
-    loop {
-        let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep_ms = retry_interval_ms + jitter_ms;
-        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
-        if (std::time::Instant::now() + to_sleep) > retry_end {
-            return last_rep;
-        }
-        sleep(to_sleep);
-        if let Ok(last_rep) = last_rep {
-            // Actively consume the reader to return the connection to the connection pool.
-            // see https://github.com/algesten/ureq/issues/94
-            _ = last_rep.into_body().read_to_vec();
-        }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout);
-        if !need_retry {
-            return last_rep;
-        }
-        retry_interval_ms = (retry_interval_ms * 2).min(1000);
-    }
-}
-
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
-pub(super) fn http_send_with_retries(
-    state: &SyncHttpHandlerState,
-    buf: &[u8],
-    request_timeout: Duration,
-    retry_timeout: Duration,
-) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
-    if !need_retry || retry_timeout.is_zero() {
-        return last_rep;
-    }
-
-    retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
+pub(crate) struct ServerSettings {
+    pub supported_versions: Vec<ProtocolVersion>,
+    pub max_name_len: usize,
 }
 
 /// Read the server settings from the `/settings` endpoint.
-/// This function returns:
-///   - A list of supported protocol versions: Default is V1.
-///   - The server's max name length: Default is 127.
 ///
 /// If the server does not support the `/settings` endpoint (404), it returns
 /// default values.
 pub(crate) fn read_server_settings(
-    state: &SyncHttpHandlerState,
+    agent: &ureq::Agent,
     settings_url: &str,
+    request_timeout: Duration,
     default_max_name_len: usize,
-) -> Result<(Vec<ProtocolVersion>, usize), Error> {
+) -> Result<ServerSettings, Error> {
     let default_protocol_version = ProtocolVersion::V1;
+    let default_settings = ServerSettings {
+        supported_versions: vec![default_protocol_version],
+        max_name_len: default_max_name_len,
+    };
 
     let response = match http_get_with_retries(
-        state,
+        agent,
         settings_url,
-        *state.config.request_timeout,
+        request_timeout,
         Duration::from_secs(1),
     ) {
         Ok(res) => {
@@ -405,7 +421,7 @@ pub(crate) fn read_server_settings(
                 let status = res.status();
                 _ = res.into_body().read_to_vec();
                 if status.as_u16() == 404 {
-                    return Ok((vec![default_protocol_version], default_max_name_len));
+                    return Ok(default_settings);
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
@@ -421,7 +437,7 @@ pub(crate) fn read_server_settings(
             let e = match err {
                 ureq::Error::StatusCode(code) => {
                     if code == 404 {
-                        return Ok((vec![default_protocol_version], default_max_name_len));
+                        return Ok(default_settings);
                     } else {
                         fmt!(
                             ProtocolVersionError,
@@ -447,50 +463,125 @@ pub(crate) fn read_server_settings(
     let (_, body) = response.into_parts();
     let body_content = body.into_with_config().read_to_string();
 
-    if let Ok(msg) = body_content {
-        let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
-            error::fmt!(
+    let msg = match body_content {
+        Ok(m) => m,
+        Err(_) => {
+            return Err(error::fmt!(
                 ProtocolVersionError,
-                "Malformed server response, settings url: {}, err: response is not valid JSON.",
-                settings_url,
-            )
-        })?;
+                "Malformed server response, settings url: {}, err: failed to read response body as UTF-8",
+                settings_url
+            ));
+        }
+    };
 
-        let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json
-            .get("config")
-            .and_then(|v| v.get("line.proto.support.versions"))
-        {
-            for value in values.iter() {
-                if let Some(v) = value.as_u64() {
-                    match v {
-                        1 => support_versions.push(ProtocolVersion::V1),
-                        2 => support_versions.push(ProtocolVersion::V2),
-                        _ => {}
-                    }
+    let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
+        error::fmt!(
+            ProtocolVersionError,
+            "Malformed server response, settings url: {}, err: response is not valid JSON.",
+            settings_url,
+        )
+    })?;
+
+    let mut support_versions: Vec<ProtocolVersion> = vec![];
+    if let Some(serde_json::Value::Array(ref values)) = json
+        .get("config")
+        .and_then(|v| v.get("line.proto.support.versions"))
+    {
+        for value in values.iter() {
+            if let Some(v) = value.as_u64() {
+                match v {
+                    1 => support_versions.push(ProtocolVersion::V1),
+                    2 => support_versions.push(ProtocolVersion::V2),
+                    _ => {}
                 }
             }
-        } else {
-            support_versions.push(default_protocol_version);
+        }
+    } else {
+        support_versions.push(default_protocol_version);
+    }
+
+    let max_name_length = json
+        .get("config")
+        .and_then(|v| v.get("cairo.max.file.name.length"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_max_name_len as u64) as usize;
+
+    Ok(ServerSettings {
+        supported_versions: support_versions,
+        max_name_len: max_name_length,
+    })
+}
+
+fn get_request(
+    agent: &ureq::Agent,
+    url: &str,
+    request_timeout: Duration,
+) -> (bool, Result<Response<Body>, ureq::Error>) {
+    let request = agent
+        .get(url)
+        .config()
+        .timeout_per_call(Some(request_timeout))
+        .build();
+    let response = request.call();
+    match &response {
+        Ok(res) => (need_retry(Ok(res.status())), response),
+        Err(err) => (need_retry(Err(err)), response),
+    }
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn retry_http<F1, F2>(
+    request_timeout: Duration,
+    retry_timeout: Duration,
+    mut request_fn: F1,
+    mut need_retry_fn: F2,
+) -> Result<Response<Body>, ureq::Error>
+where
+    F1: FnMut(Duration) -> Result<Response<Body>, ureq::Error>,
+    F2: FnMut(&Result<Response<Body>, ureq::Error>) -> bool,
+{
+    // initial_request
+    let mut last_rep = request_fn(request_timeout);
+    let need_retry = need_retry_fn(&last_rep);
+    if !need_retry || retry_timeout.is_zero() {
+        return last_rep;
+    }
+
+    let mut rng = rand::rng();
+    let retry_end = std::time::Instant::now() + retry_timeout;
+    let mut retry_interval_ms = 10;
+    let mut need_retry;
+
+    loop {
+        let jitter_ms = rng.random_range(-5i32..5);
+        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+
+        if (std::time::Instant::now() + to_sleep) > retry_end {
+            return last_rep;
         }
 
-        let max_name_length = json
-            .get("config")
-            .and_then(|v| v.get("cairo.max.file.name.length"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(default_max_name_len as u64) as usize;
-        Ok((support_versions, max_name_length))
-    } else {
-        Err(error::fmt!(
-            ProtocolVersionError,
-            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
-        ))
+        sleep(to_sleep);
+
+        if let Ok(last_rep) = last_rep {
+            // Consume the body to return the connection to the pool
+            _ = last_rep.into_body().read_to_vec();
+        }
+
+        last_rep = request_fn(request_timeout);
+        need_retry = need_retry_fn(&last_rep);
+
+        if !need_retry {
+            return last_rep;
+        }
+
+        retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_get(
-    state: &SyncHttpHandlerState,
+    agent: &ureq::Agent,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -513,7 +604,7 @@ fn retry_http_get(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.get_request(url, request_timeout);
+        (need_retry, last_rep) = get_request(agent, url, request_timeout);
         if !need_retry {
             return last_rep;
         }
@@ -523,15 +614,15 @@ fn retry_http_get(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn http_get_with_retries(
-    state: &SyncHttpHandlerState,
+    agent: &ureq::Agent,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.get_request(url, request_timeout);
+    let (need_retry, last_rep) = get_request(agent, url, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
 
-    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
+    retry_http_get(agent, url, request_timeout, retry_timeout, last_rep)
 }

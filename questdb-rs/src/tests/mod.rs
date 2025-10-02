@@ -25,9 +25,9 @@
 mod f64_serializer;
 
 #[cfg(feature = "sync-sender-http")]
-mod http;
+pub mod http;
 
-mod mock;
+pub mod mock;
 mod sender;
 
 mod ndarr;
