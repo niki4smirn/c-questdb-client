@@ -399,24 +399,15 @@ impl SenderBuilder {
                 "Missing \"addr\" parameter in config string"
             ));
         };
-        let mut builder = if addrs.len() == 1 {
-            let addr = &addrs[0];
+        let mut endpoints = Vec::with_capacity(addrs.len());
+        for addr in addrs.iter() {
             let (host, port) = match addr.split_once(':') {
                 Some((h, p)) => (h, p),
                 None => (addr.as_str(), protocol.default_port()),
             };
-            SenderBuilder::new(protocol, host, port)
-        } else {
-            let mut endpoints = Vec::with_capacity(addrs.len());
-            for addr in addrs.iter() {
-                let (host, port) = match addr.split_once(':') {
-                    Some((h, p)) => (h, p),
-                    None => (addr.as_str(), protocol.default_port()),
-                };
-                endpoints.push((host, port));
-            }
-            SenderBuilder::new_multi_endpoints(protocol, endpoints)
-        };
+            endpoints.push((host, port));
+        }
+        let mut builder = SenderBuilder::new_multi_endpoints(protocol, endpoints);
 
         validate_auto_flush_params(params)?;
 

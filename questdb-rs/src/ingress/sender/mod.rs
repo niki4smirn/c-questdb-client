@@ -200,7 +200,6 @@ impl Sender {
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {
-                            println!("parsing {res:?}");
                             Err(parse_http_error(res.status().as_u16(), res))
                         } else {
                             res.into_body();
