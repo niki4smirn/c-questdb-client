@@ -11,6 +11,8 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
+[patch.crates-io]
+questdb-confstr = { path = "../../questdb-confstr-rs/questdb-confstr/" }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"

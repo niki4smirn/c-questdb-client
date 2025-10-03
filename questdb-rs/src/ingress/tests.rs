@@ -23,7 +23,6 @@
  ******************************************************************************/
 
 use super::*;
-#[cfg(feature = "sync-sender-http")]
 use crate::ErrorCode;
 
 #[cfg(feature = "sync-sender-tcp")]

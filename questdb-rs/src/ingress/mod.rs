@@ -1098,6 +1098,7 @@ impl SenderBuilder {
     }
 
     // use for http/https
+    #[cfg(feature = "sync-sender-http")]
     fn build_http(
         &self,
         tls_settings: Option<TlsSettings>,
@@ -1186,8 +1187,8 @@ impl SenderBuilder {
             Some(settings) => settings,
             None => {
                 return Err(fmt!(
-                    ConfigError,
-                    "Reading settings failed for all endpoints configured."
+                    ProtocolVersionError,
+                    "Could not detect server's line protocol version"
                 ))
             }
         };
@@ -1221,6 +1222,7 @@ impl SenderBuilder {
     }
 
     // use for tcp/tcps
+    #[cfg(feature = "sync-sender-tcp")]
     fn build_tcp(
         &self,
         tls_settings: Option<TlsSettings>,
@@ -1252,6 +1254,7 @@ impl SenderBuilder {
         })
     }
 
+    #[cfg(feature = "sync-sender-http")]
     fn build_agent(&self, tls_settings: Option<TlsSettings>) -> Result<ureq::Agent> {
         use ureq::unversioned::transport::Connector;
         use ureq::unversioned::transport::TcpConnector;

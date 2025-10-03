@@ -60,11 +60,14 @@ pub(crate) struct SyncHttpHandlerState {
 }
 
 #[derive(Debug)]
-pub(crate) struct SendError<'a>(ureq::Error, &'a str); // with url
+pub(crate) struct SendError<'a> {
+    pub(crate) error: ureq::Error,
+    pub(crate) url: &'a str,
+}
 
 impl<'a> SendError<'a> {
     pub fn into_parts(self) -> (ureq::Error, &'a str) {
-        (self.0, self.1)
+        (self.error, self.url)
     }
 }
 
@@ -119,7 +122,7 @@ impl SyncHttpHandlerState {
         let url = self.urls[self.active_url_idx].as_str();
         let resp = self.send_with_retries(url, buf, request_timeout, retry_timeout);
         if !need_to_failover(&resp) || self.urls.len() == 1 {
-            return resp.map_err(|err| SendError(err, url));
+            return resp.map_err(|err| SendError { error: err, url });
         }
         let bad_url = url;
 
@@ -131,13 +134,13 @@ impl SyncHttpHandlerState {
             let resp = self.send_with_retries(url, buf, request_timeout, retry_timeout);
             if !need_to_failover(&resp) {
                 self.active_url_idx = idx;
-                return resp.map_err(|err| SendError(err, url));
+                return resp.map_err(|err| SendError { error: err, url });
             }
         }
 
         // in case all of them are bad return the first one
         // maybe want to create explicit error AllFailed ?
-        resp.map_err(|err| SendError(err, url))
+        resp.map_err(|err| SendError { error: err, url })
     }
 }
 
