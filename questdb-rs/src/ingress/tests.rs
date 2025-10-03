@@ -33,8 +33,10 @@ use tempfile::TempDir;
 fn http_simple() {
     let builder = SenderBuilder::from_conf("http::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Http);
-    assert_specified_eq(&builder.host, "127.0.0.1");
-    assert_specified_eq(&builder.port, Protocol::Http.default_port());
+    assert_specified_endpoints_eq(
+        &builder.endpoints,
+        vec![("127.0.0.1", Protocol::Http.default_port())],
+    );
     assert!(!builder.protocol.tls_enabled());
 }
 
@@ -43,8 +45,10 @@ fn http_simple() {
 fn https_simple() {
     let builder = SenderBuilder::from_conf("https::addr=localhost;").unwrap();
     assert_eq!(builder.protocol, Protocol::Https);
-    assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, Protocol::Https.default_port());
+    assert_specified_endpoints_eq(
+        &builder.endpoints,
+        vec![("localhost", Protocol::Https.default_port())],
+    );
     assert!(builder.protocol.tls_enabled());
 
     #[cfg(feature = "tls-webpki-certs")]
@@ -59,8 +63,10 @@ fn https_simple() {
 fn tcp_simple() {
     let builder = SenderBuilder::from_conf("tcp::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
-    assert_specified_eq(&builder.port, Protocol::Tcp.default_port());
-    assert_specified_eq(&builder.host, "127.0.0.1");
+    assert_specified_endpoints_eq(
+        &builder.endpoints,
+        vec![("127.0.0.1", Protocol::Tcp.default_port())],
+    );
     assert!(!builder.protocol.tls_enabled());
 }
 
@@ -69,8 +75,10 @@ fn tcp_simple() {
 fn tcps_simple() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcps);
-    assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, Protocol::Tcps.default_port());
+    assert_specified_endpoints_eq(
+        &builder.endpoints,
+        vec![("localhost", Protocol::Tcps.default_port())],
+    );
     assert!(builder.protocol.tls_enabled());
 
     #[cfg(feature = "tls-webpki-certs")]
@@ -604,4 +612,21 @@ fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     };
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert_eq!(err.msg(), expect_msg.as_ref());
+}
+
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+fn assert_specified_endpoints_eq<V: Into<Vec<(&'static str, &'static str)>>>(
+    actual: &ConfigSetting<Vec<Endpoint>>,
+    expected: V,
+) {
+    let expected_pairs: Vec<(&str, &str)> = expected.into();
+    if let ConfigSetting::Specified(actual_value) = actual {
+        let pairs: Vec<(&str, &str)> = actual_value
+            .iter()
+            .map(|ep| (ep.host.as_str(), ep.port.as_str()))
+            .collect();
+        assert_eq!(pairs, expected_pairs);
+    } else {
+        panic!("Expected Specified(endpoints), but got {:?}", actual);
+    }
 }

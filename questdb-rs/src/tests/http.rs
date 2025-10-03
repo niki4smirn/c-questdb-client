@@ -22,7 +22,8 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
+use crate::error::Result;
+use crate::ingress::{Buffer, Protocol, ProtocolVersion, Sender, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::tests::{assert_err_contains, TestResult};
 use crate::ErrorCode;
@@ -878,4 +879,500 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
         "Protocol version v1 does not support array datatype",
     );
     Ok(())
+}
+
+#[cfg(feature = "sync-sender-http")]
+mod multi_endpoint {
+    use std::io;
+
+    use super::*;
+
+    #[derive(PartialEq, Eq)]
+    struct WriteStatusCode {
+        code: u16,
+        text: String,
+        body: String,
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum WriteState {
+        NotAccepting,
+        Accepting,
+        Error(WriteStatusCode),
+    }
+
+    struct ServerConfig {
+        expect_settings: bool,
+        expect_write: WriteState,
+    }
+
+    impl Default for ServerConfig {
+        fn default() -> Self {
+            Self {
+                expect_settings: false,
+                expect_write: WriteState::NotAccepting,
+            }
+        }
+    }
+
+    fn spawn_server(server: MockServer, cfg: ServerConfig) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut srv = server;
+            let accepting_writes = cfg.expect_write != WriteState::NotAccepting;
+            if cfg.expect_settings || accepting_writes {
+                srv.accept().unwrap();
+            }
+
+            if cfg.expect_settings {
+                let req = srv.recv_http_q().unwrap();
+                assert_eq!(req.method(), "GET");
+                assert!(req.path().ends_with("/settings"));
+                srv.send_settings_response().unwrap();
+            }
+
+            if accepting_writes {
+                loop {
+                    match srv.recv_http(0.5) {
+                        Ok(req) => {
+                            assert_eq!(req.method(), "POST");
+                            assert!(req.path().starts_with("/write"));
+                            let resp = if let WriteState::Error(ref status_code) = cfg.expect_write
+                            {
+                                HttpResponse::empty()
+                                    .with_status(status_code.code, &status_code.text)
+                                    .with_body_str(&status_code.body)
+                            } else {
+                                HttpResponse::empty()
+                            };
+                            srv.send_http_response_q(resp).unwrap();
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::TimedOut => break,
+                        Err(err) => {
+                            panic!("Receiving http: {err:?}")
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn build_sender(endpoints: Vec<(&str, u16)>) -> Sender {
+        SenderBuilder::new_multi_endpoints(Protocol::Http, endpoints)
+            .request_min_throughput(0)
+            .unwrap()
+            .request_timeout(Duration::from_millis(100))
+            .unwrap()
+            .retry_timeout(Duration::from_millis(300))
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn version_auto_v2() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 130);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1], 130);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(s2, ServerConfig::default());
+
+        let sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        // autodetecting only based on the first endpoint in config
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn version_auto_v1() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1], 110);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 100);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(s2, ServerConfig::default());
+
+        let sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        // autodetecting only based on the first endpoint in config
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V1);
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    fn flush(sender: &mut Sender) -> Result<()> {
+        let mut buf = sender.new_buffer();
+        buf.table("x")
+            .unwrap()
+            .symbol("x", "x")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buf)
+    }
+
+    #[test]
+    fn respect_config_order() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 120);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(s2, ServerConfig::default());
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn check_accepting() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 120);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 404,
+                    text: "Not Found".to_string(),
+                    body: "".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn failover_on_404() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 404,
+                    text: "Not Found".to_string(),
+                    body: "".to_string(),
+                }),
+            },
+        );
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn failover_on_421() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 421,
+                    text: "Misdirected Request".to_string(),
+                    body: "".to_string(),
+                }),
+            },
+        );
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn failover_on_conn_err() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(s1, ServerConfig::default());
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn no_failover_on_500() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 500,
+                    text: "Internal Server Error".to_string(),
+                    body: "Maybe one more time?".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(s2, ServerConfig::default());
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        let flush_res = flush(&mut sender);
+        assert!(flush_res.is_err());
+        let flush_err = flush_res.err().unwrap();
+        assert_eq!(
+            flush_err.msg(),
+            format!("Could not flush buffer: Maybe one more time?")
+        );
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn no_failover_on_418() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let t1 = spawn_server(
+            s1,
+            ServerConfig {
+                expect_settings: true,
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 418,
+                    text: "I'm a teapot".to_string(),
+                    body: "Would you like some tea instead?".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let t2 = spawn_server(s2, ServerConfig::default());
+
+        let mut sender = build_sender(vec![("127.0.0.1", p1), ("127.0.0.1", p2)]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        let flush_res = flush(&mut sender);
+        assert!(flush_res.is_err());
+        let flush_err = flush_res.err().unwrap();
+        assert_eq!(
+            flush_err.msg(),
+            format!("Could not flush buffer: Would you like some tea instead?")
+        );
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn failover_on_conn_err_3_endpoints() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+        let s3 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let p3 = s3.port;
+        let t1 = spawn_server(s1, ServerConfig::default());
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_settings: true,
+                ..Default::default()
+            },
+        );
+
+        let t3 = spawn_server(
+            s3,
+            ServerConfig {
+                expect_write: WriteState::Accepting,
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![
+            ("127.0.0.1", p1),
+            ("127.0.0.1", p2),
+            ("127.0.0.1", p3),
+        ]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        flush(&mut sender).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+    }
+
+    #[test]
+    fn all_fail() {
+        let s1 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[1, 2], 127);
+        let s2 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+        let s3 = MockServer::new()
+            .unwrap()
+            .configure_settings_response(&[2], 127);
+
+        let p1 = s1.port;
+        let p2 = s2.port;
+        let p3 = s3.port;
+        let t1 = spawn_server(s1, ServerConfig::default());
+        let t2 = spawn_server(
+            s2,
+            ServerConfig {
+                expect_settings: true,
+                ..Default::default()
+            },
+        );
+
+        let t3 = spawn_server(
+            s3,
+            ServerConfig {
+                expect_write: WriteState::Error(WriteStatusCode {
+                    code: 404,
+                    text: "Not Found".to_string(),
+                    body: "".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut sender = build_sender(vec![
+            ("127.0.0.1", p1),
+            ("127.0.0.1", p2),
+            ("127.0.0.1", p3),
+        ]);
+        assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
+        let flush_res = flush(&mut sender);
+        // don't want to give guarantees on what error is returned, so just checking that flush
+        // returned an err
+        assert!(flush_res.is_err());
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+    }
 }
